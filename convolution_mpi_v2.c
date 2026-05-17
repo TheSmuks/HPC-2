@@ -48,6 +48,8 @@ ImagenData initimage(char* nombre, FILE **fp, int partitions, int halo);
 ImagenData duplicateImageData(ImagenData src, int partitions, int halo);
 
 int readImage(ImagenData Img, FILE **fp, int dim, int halosize, long int *position);
+int readImageFast(int *R, int *G, int *B, FILE *fp, long *position,
+                  int pixel_count, int image_width, int halosize);
 int initfilestore(ImagenData img, FILE **fp, char* nombre, long *position);
 int savingChunk(ImagenData img, FILE **fp, int dim, int offset);
 int convolve2D(int* inbuf, int* outbuf, int sizeX, int sizeY, float* kernel, int ksizeX, int ksizeY);
@@ -102,19 +104,44 @@ ImagenData initimage(char* nombre, FILE **fp,int partitions, int halo){
 }
 
 //Read the corresponding chunk from the source Image
-int readImage(ImagenData img, FILE **fp, int dim, int halosize, long *position){
-    int i=0, k=0,haloposition=0;
-    if (fseek(*fp,*position,SEEK_SET))
+int readImageFast(int *R, int *G, int *B, FILE *fp, long *position,
+                  int pixel_count, int image_width, int halosize){
+    if (fseek(fp, *position, SEEK_SET)) {
         perror("Error: ");
-    haloposition = dim-(img->ancho*halosize*2);
-    for(i=0;i<dim;i++) {
-        // When start reading the halo store the position in the image file
-        if (halosize != 0 && i == haloposition) *position=ftell(*fp);
-        fscanf(*fp,"%d %d %d ",&img->R[i],&img->G[i],&img->B[i]);
-        k++;
+        return -1;
     }
-//    printf ("Readed = %d pixels, posicio=%lu\n",k,*position);
+
+    int haloposition = pixel_count - (image_width * halosize * 2);
+    long start_position = *position;
+    long buf_size = (long)pixel_count * 16 + 1024;
+    char *buf = (char *)malloc(buf_size + 1);
+    if (!buf) {
+        return -1;
+    }
+
+    long bytes_read = fread(buf, 1, buf_size, fp);
+    buf[bytes_read] = '\0';
+
+    char *ptr = buf;
+    for (int i = 0; i < pixel_count; i++) {
+        if (halosize > 0 && i == haloposition) {
+            *position = start_position + (long)(ptr - buf);
+        }
+        R[i] = (int)strtol(ptr, &ptr, 10);
+        G[i] = (int)strtol(ptr, &ptr, 10);
+        B[i] = (int)strtol(ptr, &ptr, 10);
+    }
+
+    if (halosize == 0) {
+        *position = start_position + (long)(ptr - buf);
+    }
+
+    free(buf);
     return 0;
+}
+
+int readImage(ImagenData img, FILE **fp, int dim, int halosize, long *position){
+    return readImageFast(img->R, img->G, img->B, *fp, position, dim, img->ancho, halosize);
 }
 
 // Open kernel file and reading kernel matrix. The kernel matrix 2D is stored in 1D format.
@@ -183,70 +210,43 @@ void freeImagestructure(ImagenData *src){
     free(*src);
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// 2D convolution
-// 2D data are usually stored in computer memory as contiguous 1D array.
-// So, we are using 1D array for 2D data.
-// 2D convolution assumes the kernel is center originated, which means, if
-// kernel size 3 then, k[-1], k[0], k[1]. The middle of index is always 0.
-// The following programming logics are somewhat complicated because of using
-// pointer indexing in order to minimize the number of multiplications.
-//
-//
-// signed integer (32bit) version:
-///////////////////////////////////////////////////////////////////////////////
 int convolve2D(int* in, int* out, int dataSizeX, int dataSizeY,
                float* kernel, int kernelSizeX, int kernelSizeY)
 {
-    int kCenterX, kCenterY;
+    if (!in || !out || !kernel) return -1;
+    if (dataSizeX <= 0 || kernelSizeX <= 0) return -1;
 
-    // check validity of params
-    if(!in || !out || !kernel) return -1;
-    if(dataSizeX <= 0 || kernelSizeX <= 0) return -1;
-    
-    // find center position of kernel (half of kernel size)
-    kCenterX = (int)kernelSizeX / 2;
-    kCenterY = (int)kernelSizeY / 2;
-    
-    // init working  pointers
-    // inPtr = inPtr2 = &in[dataSizeX * kCenterY + kCenterX];  // note that  it is shifted (kCenterX, kCenterY),
-    // omp directive here
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < dataSizeY; ++i)
-    for (int j = 0; j < dataSizeX; ++j)
+    int kCenterX = kernelSizeX / 2;
+    int kCenterY = kernelSizeY / 2;
+
+    int paddedW = dataSizeX + 2 * kCenterX;
+    int paddedH = dataSizeY + 2 * kCenterY;
+
+    int *padded = (int *) calloc(paddedW * paddedH, sizeof(int));
+    if (!padded) return -1;
+
+    for (int i = 0; i < dataSizeY; i++)
+        for (int j = 0; j < dataSizeX; j++)
+            padded[(i + kCenterY) * paddedW + (j + kCenterX)] = in[i * dataSizeX + j];
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int i = 0; i < dataSizeY; i++)
+    for (int j = 0; j < dataSizeX; j++)
     {
-        int rowMax = i + kCenterY;
-        int rowMin = i - dataSizeY + kCenterY;
+        float sum = 0.0f;
 
-        int colMax = j + kCenterX;
-        int colMin = j - dataSizeX + kCenterX;
-
-        int sum = 0;
-
-        for (int m = 0; m < kernelSizeY; ++m)
+        for (int m = 0; m < kernelSizeY; m++)
+        for (int n = 0; n < kernelSizeX; n++)
         {
-            if (m <= rowMax && m > rowMin)
-            {
-                for (int n = 0; n < kernelSizeX; ++n)
-                {
-                    if (n <= colMax && n > colMin)
-                    {
-                        int input_row = i + (kCenterY - m);
-                        int input_col = j + (kCenterX - n);
-
-                        sum += in[input_row * dataSizeX + input_col] *
-                            kernel[m * kernelSizeX + n];
-                    }
-                }
-            }
+            int pr = i + kCenterY + (kCenterY - m);
+            int pc = j + kCenterX + (kCenterX - n);
+            sum += padded[pr * paddedW + pc] * kernel[m * kernelSizeX + n];
         }
 
-        if (sum >= 0)
-            out[i * dataSizeX + j] = (int)(sum + 0.5f);
-        else
-            out[i * dataSizeX + j] = (int)(sum - 0.5f);
+        out[i * dataSizeX + j] = (int)(sum >= 0 ? sum + 0.5f : sum - 0.5f);
     }
-    
+
+    free(padded);
     return 0;
 }
 
@@ -430,12 +430,15 @@ int master(int argc, char **argv) {
     if (worker_count <= 0) {
         return -1;
     }
-    // Broadcast kernel data to all workers
+
     start = MPI_Wtime();
-   BcastHeader hdr = {kernel_data->kernelX, kernel_data->kernelY,
+    BcastHeader hdr = {kernel_data->kernelX, kernel_data->kernelY,
                    source_image->ancho, source_image->altura, source_image->maxcolor};
     MPI_Bcast(&hdr, sizeof(BcastHeader), MPI_BYTE, 0, MPI_COMM_WORLD);
     MPI_Bcast(kernel_data->vkern, hdr.kernelX * hdr.kernelY, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    int image_path_len = (int)strlen(argv[1]) + 1;
+    MPI_Bcast(&image_path_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(argv[1], image_path_len, MPI_CHAR, 0, MPI_COMM_WORLD);
     mpi_time_accum += MPI_Wtime() - start;
     
     ChunkInfo *all_chunks;
@@ -445,6 +448,41 @@ int master(int argc, char **argv) {
                       file_position, total_chunks, chunks_per_partition,
                       source_image->altura, source_image->ancho,
                       partition_count, kernel_radius);
+
+    int max_chunk_pixels = 0;
+    for (int c = 0; c < valid_chunk_count; c++) {
+        if (all_chunks[c].pixel_count > max_chunk_pixels) {
+            max_chunk_pixels = all_chunks[c].pixel_count;
+        }
+    }
+
+    int *scan_r = NULL;
+    int *scan_g = NULL;
+    int *scan_b = NULL;
+    long *chunk_byte_offsets = NULL;
+    if (max_chunk_pixels > 0) {
+        scan_r = (int *)malloc(sizeof(int) * max_chunk_pixels);
+        scan_g = (int *)malloc(sizeof(int) * max_chunk_pixels);
+        scan_b = (int *)malloc(sizeof(int) * max_chunk_pixels);
+        chunk_byte_offsets = (long *)malloc(sizeof(long) * valid_chunk_count);
+        if (!scan_r || !scan_g || !scan_b || !chunk_byte_offsets) {
+            free(scan_r); free(scan_g); free(scan_b); free(chunk_byte_offsets);
+            return -1;
+        }
+    }
+
+    start = MPI_Wtime();
+    long scan_position = source_position;
+    for (int c = 0; c < valid_chunk_count; c++) {
+        chunk_byte_offsets[c] = scan_position;
+        if (readImageFast(scan_r, scan_g, scan_b, source_file, &scan_position,
+                          all_chunks[c].pixel_count, source_image->ancho, kernel_radius)) {
+            free(scan_r); free(scan_g); free(scan_b); free(chunk_byte_offsets);
+            return -1;
+        }
+    }
+    tread = tread + (MPI_Wtime() - start);
+    free(scan_r); free(scan_g); free(scan_b);
     
     int *result_ready = calloc(valid_chunk_count, sizeof(int));
     int **resR = calloc(valid_chunk_count, sizeof(int*));
@@ -464,18 +502,13 @@ int master(int argc, char **argv) {
             MPI_Recv(NULL, 0, MPI_BYTE, worker_rank, WORK_TAG, MPI_COMM_WORLD, &status);
             mpi_time_accum += MPI_Wtime() - start;
             if (next_chunk_to_assign < valid_chunk_count) {
-                
                 ChunkInfo *info = &all_chunks[next_chunk_to_assign];
-
-                double read_start = MPI_Wtime();
-                if (readImage(source_image, &source_file, info->pixel_count, kernel_radius, &source_position)) {
-                    return -1;
-                }
-                tread = tread + (MPI_Wtime() - read_start);
 
                 start = MPI_Wtime();
                 send_chunk_info(info, worker_rank, WORK_TAG);
-                send_rgb_packed(source_image->R, source_image->G, source_image->B, info->pixel_count, worker_rank, WORK_TAG);
+                MPI_Send(&chunk_byte_offsets[next_chunk_to_assign], 1, MPI_LONG,
+                         worker_rank, WORK_TAG, MPI_COMM_WORLD);
+                mpi_time_accum += MPI_Wtime() - start;
                 next_chunk_to_assign++;
             } else {
                 start = MPI_Wtime();
@@ -488,7 +521,6 @@ int master(int argc, char **argv) {
             recv_chunk_info(&chunk_info, worker_rank, RESULT_TAG, &status);
             int ci = chunk_info.partition_index;
 
-            // Receive into per-chunk buffers (small: 1 chunk, not full image)
             resR[ci] = malloc(sizeof(int) * chunk_info.pixel_count);
             resG[ci] = malloc(sizeof(int) * chunk_info.pixel_count);
             resB[ci] = malloc(sizeof(int) * chunk_info.pixel_count);
@@ -497,7 +529,6 @@ int master(int argc, char **argv) {
             result_infos[ci] = chunk_info;
             result_ready[ci] = 1;
 
-            // Flush all consecutive ready chunks in order
             while (next_to_write < valid_chunk_count && result_ready[next_to_write]) {
                 ChunkInfo *wi = &result_infos[next_to_write];
                 int off = wi->output_offset;
@@ -518,6 +549,7 @@ int master(int argc, char **argv) {
     free(result_ready);
     free(resR); free(resG); free(resB);
     free(result_infos);
+    free(chunk_byte_offsets);
 
     double worker_mpi_local = (mpi_rank == 0) ? 0.0 : mpi_time_accum;
     double worker_mpi_time = 0.0;
@@ -558,11 +590,27 @@ int worker(int argc, char **argv) {
     double start;
 
         start = MPI_Wtime();
-    BcastHeader hdr;
-    MPI_Bcast(&hdr, sizeof(BcastHeader), MPI_BYTE, 0, MPI_COMM_WORLD);
-    float *vkern = malloc(hdr.kernelX * hdr.kernelY * sizeof(float));
-    MPI_Bcast(vkern, hdr.kernelX * hdr.kernelY, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    mpi_time_accum += MPI_Wtime() - start;
+        BcastHeader hdr;
+        MPI_Bcast(&hdr, sizeof(BcastHeader), MPI_BYTE, 0, MPI_COMM_WORLD);
+        float *vkern = malloc(hdr.kernelX * hdr.kernelY * sizeof(float));
+        MPI_Bcast(vkern, hdr.kernelX * hdr.kernelY, MPI_FLOAT, 0, MPI_COMM_WORLD);
+        int image_path_len = 0;
+        MPI_Bcast(&image_path_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        char *image_path = (char *)malloc((size_t)image_path_len);
+        if (!image_path) {
+            free(vkern);
+            return -1;
+        }
+        MPI_Bcast(image_path, image_path_len, MPI_CHAR, 0, MPI_COMM_WORLD);
+        mpi_time_accum += MPI_Wtime() - start;
+
+        FILE *worker_fp = fopen(image_path, "r");
+        free(image_path);
+        if (!worker_fp) {
+            perror("Error: ");
+            free(vkern);
+            return -1;
+        }
 
     while(1){
         start = MPI_Wtime();
@@ -578,7 +626,6 @@ int worker(int argc, char **argv) {
             mpi_time_accum += MPI_Wtime() - start;
             break;
         } else if(status.MPI_TAG == WORK_TAG) {
-            // Read data size from master
             ChunkInfo chunk_info;
             recv_chunk_info(&chunk_info, 0, WORK_TAG, &status);
 
@@ -597,7 +644,19 @@ int worker(int argc, char **argv) {
                 return -1;
             }
 
-            recv_rgb_packed(source_r, source_g, source_b, pixel_count, 0, WORK_TAG, &status);
+            long chunk_offset = 0;
+            start = MPI_Wtime();
+            MPI_Recv(&chunk_offset, 1, MPI_LONG, 0, WORK_TAG, MPI_COMM_WORLD, &status);
+            mpi_time_accum += MPI_Wtime() - start;
+
+            if (readImageFast(source_r, source_g, source_b, worker_fp, &chunk_offset,
+                              pixel_count, hdr.ancho, hdr.kernelY / 2)) {
+                free(source_r); free(source_g); free(source_b);
+                free(result_r); free(result_g); free(result_b);
+                fclose(worker_fp);
+                free(vkern);
+                return -1;
+            }
 
             start = MPI_Wtime();
             convolve2D(source_r, result_r, hdr.ancho, chunk_info.chunk_height, vkern, hdr.kernelX, hdr.kernelY);
@@ -605,7 +664,6 @@ int worker(int argc, char **argv) {
             convolve2D(source_b, result_b, hdr.ancho, chunk_info.chunk_height, vkern, hdr.kernelX, hdr.kernelY);
             omp_time_accum += MPI_Wtime() - start;
 
-            // Send the result back to master
             send_chunk_info(&chunk_info, 0, RESULT_TAG);
             send_rgb_packed(result_r, result_g, result_b, pixel_count, 0, RESULT_TAG);
 
@@ -620,6 +678,7 @@ int worker(int argc, char **argv) {
     double worker_mpi_local = mpi_time_accum;
     MPI_Reduce(&worker_mpi_local, &dummy, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
+    fclose(worker_fp);
     free(vkern);
     
     return 0;
